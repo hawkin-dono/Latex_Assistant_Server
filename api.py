@@ -20,21 +20,16 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Dict
 import base64
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from io import BytesIO
 from PIL import Image, ImageEnhance
-import json
 import os
-import sys
-import math
 from torchvision import transforms
-from torchvision.models import mobilenet_v3_large
+from together_api_model import get_together_response 
+from dynamic_reasoning_solver import DynamicKAGSolver
 
 from image_to_latex_model import Im2LatexModel, load_vocab, decode_prediction
-from latex_renderer import render_latex_to_html
+from latex_handler import render_latex_to_html
 
 app = FastAPI()
 
@@ -47,7 +42,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# Khai báo biến global solver
+solver = None
 
 def preprocess_image(image):
     transform = transforms.Compose([
@@ -90,6 +86,21 @@ try:
 except Exception as e:
     print(f"Error loading model: {e}")
     model = None
+    
+    
+def get_latex_tmp_path():
+    # files = os.listdir("tmp_res")
+    # max_cnt = 0
+    # for file in files:
+    #     try:
+    #         file_name = file.split(".")[0]
+    #         cnt = int(file_name.split("_")[1])
+    #         max_cnt = max(max_cnt, cnt)
+    #     except:
+    #         pass
+    # return os.path.join("tmp_res", f"tmp_{max_cnt + 1}.tex")
+    return "tmp_res/tmp.tex"
+    
 
 @app.post("/image_to_latex")
 async def image_to_latex(data: Dict[str, str] = Body(...)):
@@ -124,38 +135,84 @@ async def image_to_latex(data: Dict[str, str] = Body(...)):
 @app.post("/render_latex")
 async def render_latex(data: Dict[str, str] = Body(...)):
     """
-    Render LaTeX content to HTML
-    
-    The endpoint expects a JSON with the following format:
-    {
-        "latex": "\\documentclass{article}\\begin{document}Hello World\\end{document}"
-    }
-    
-    Returns HTML content of the rendered LaTeX
+    Render LaTeX content to HTML.
+    Input JSON: {"latex": "LaTeX content string"}
+    Output JSON: {"html": "HTML string", "css": "CSS string (optional)"} or {"error": "message"}
     """
+    print(f"Received data: {data}")
     latex_content = data.get("latex")
-    
+
     if not latex_content:
-        return JSONResponse(content={"error": "No LaTeX content provided"}, status_code=400)
-    
+        return JSONResponse(
+            content={"error": "No 'latex' field found in the request body."},
+            status_code=400
+        )
+
+    tmp_file_path = get_latex_tmp_path()
+    print(f"tmp_file_path: {tmp_file_path}")
+
     try:
-        # If the latex content doesn't have document class and begin/end document,
-        # wrap it in a basic document structure
-        if "\\documentclass" not in latex_content:
-            latex_content = f"""\\documentclass{{article}}
-\\usepackage{{amsmath}}
-\\usepackage{{amssymb}}
-\\begin{{document}}
-{latex_content}
-\\end{{document}}
-"""
+        # Save the LaTeX content to a temporary file
+        with open(tmp_file_path, "w", encoding="utf-8") as f:
+            f.write(latex_content)
         
-        result = render_latex_to_html(latex_content)
-        return JSONResponse(content=result)
         
+        rendered_output = render_latex_to_html(tmp_file_path)
+        
+        if isinstance(rendered_output, dict) and "html" in rendered_output:
+             return JSONResponse(content=rendered_output)
+        else:
+            print(f"Warning: render_latex_to_html returned an unexpected format: {type(rendered_output)}")
+            return JSONResponse(content={"html": str(rendered_output), "css": ""})
+
+    except FileNotFoundError:
+        print(f"Error: Temporary LaTeX file {tmp_file_path} not found after writing.")
+        return JSONResponse(
+            content={"error": "Failed to create or access the temporary LaTeX file."},
+            status_code=500
+        )
     except Exception as e:
-        print(f"Error rendering LaTeX: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        # Ghi log exception để debug
+        print(f"Error processing LaTeX content for {tmp_file_path}: {e}")
+        error_message = f"Failed to render LaTeX content: {str(e)}"
+        return JSONResponse(
+            content={"error": error_message, "saved_latex_path": tmp_file_path},
+            status_code=500 # Internal Server Error
+        )
+    
+@app.post("/chatbot")
+def chatbot(data: Dict[str, str] = Body(...)):
+    """
+    Chat with the model.
+    Input JSON: {"message": "User message"}
+    Output JSON: {"response": "Model response"}
+    """
+    message = data.get("message")
+    if not message:
+        return JSONResponse(content={"error": "No message provided"}, status_code=400)
+    
+    response = get_together_response(message)
+    return JSONResponse(content={"response": response})
+
+@app.post("/dynamic_reasoning")
+def dynamic_reasoning(data: Dict[str, str] = Body(...)):
+    """
+    Dynamic reasoning with the model.
+    Input JSON: {"message": "User message"}
+    Output JSON: {"response": "Model response"}
+    """
+    
+    message = data.get("message")
+    if not message:
+        return JSONResponse(content={"error": "No message provided"}, status_code=400)
+    
+    global solver
+    
+    if solver is None:
+        solver = DynamicKAGSolver()
+    response = solver.solve(message)
+    return JSONResponse(content={"response": response})
+        
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8088)
